@@ -1,18 +1,13 @@
 {
-  "builds": [
-    {
-      "src": "package.json",
-      "use": "@vercel/next"
-    },
-    {
-      "src": "main.py",
-      "use": "@vercel/python"
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60
     }
-  ],
+  },
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "/main.py"
+      "source": "/api/:path*",
+      "destination": "/api/index.py"
     }
   ]
 }

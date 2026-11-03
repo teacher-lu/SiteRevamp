@@ -2,6 +2,11 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 
+// The Next.js development proxy can time out before a long AI request completes.
+// In development, call FastAPI directly; production keeps the same-origin /api path.
+const API_BASE_URL = process.env.NODE_ENV === 'development' ? 'http://127.0.0.1:8000' : '';
+const apiUrl = (path: string) => `${API_BASE_URL}${path}`;
+
 // --- 一键复制组件 ---
 const CopyBlock = ({ number, title, subtitle, copyText, isDark, hideCopy }: { number?: number, title: string, subtitle?: React.ReactNode, copyText?: string, isDark: boolean, hideCopy?: boolean }) => {
   const [copied, setCopied] = useState(false);
@@ -110,7 +115,7 @@ export default function OptimizePage() {
 
   const fetchUserProfile = async (jwtToken: string) => {
     try {
-      const res = await fetch('/api/me', {
+      const res = await fetch(apiUrl('/api/me'), {
         headers: { 'Authorization': `Bearer ${jwtToken}` }
       });
       if (res.ok) {
@@ -131,7 +136,7 @@ export default function OptimizePage() {
     if (!token) return;
     setIsHistoryLoading(true);
     try {
-      const res = await fetch('/api/reports', {
+      const res = await fetch(apiUrl('/api/reports'), {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (res.ok) {
@@ -155,13 +160,26 @@ export default function OptimizePage() {
     setAuthError('');
     const endpoint = authMode === 'login' ? 'login' : 'register';
     try {
-      const res = await fetch(`/api/${endpoint}`, {
+      const res = await fetch(apiUrl(`/api/${endpoint}`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: authEmail, password: authPassword })
       });
-      const data = await res.json();
+      const responseText = await res.text();
+      let data: { detail?: string; access_token?: string; credits?: number };
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        throw new Error(
+          res.ok
+            ? '登录服务返回的数据格式异常，请稍后重试'
+            : '后端登录服务未正常启动，请先启动 FastAPI 服务'
+        );
+      }
       if (!res.ok) throw new Error(data.detail || '操作失败');
+      if (!data.access_token || typeof data.credits !== 'number') {
+        throw new Error('登录服务未返回有效凭证，请稍后重试');
+      }
       
       localStorage.setItem('siterevamp_token', data.access_token);
       setToken(data.access_token);
@@ -223,7 +241,7 @@ export default function OptimizePage() {
     const interval = setInterval(() => setLoadingStep(prev => (prev < 3 ? prev + 1 : prev)), 1200);
 
     try {
-      const response = await fetch('/api/analyze', {
+      const response = await fetch(apiUrl('/api/analyze'), {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -232,8 +250,23 @@ export default function OptimizePage() {
         body: JSON.stringify({ url: useUrl, keyword: useKeyword, page_type: usePageType })
       });
 
-      const data = await response.json();
+      const responseText = await response.text();
+      let data: { detail?: string; remaining_credits?: number; report?: any };
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        // A hosting proxy can return plain-text/HTML 5xx responses before FastAPI
+        // gets a chance to return its normal JSON error object.
+        throw new Error(
+          response.ok
+            ? '服务返回的数据格式异常，请稍后重试'
+            : '分析服务暂时不可用，请稍后重试；本次不会扣除积分'
+        );
+      }
       if (!response.ok) throw new Error(data.detail || '分析失败');
+      if (!data.report || typeof data.remaining_credits !== 'number') {
+        throw new Error('分析服务未返回完整报告，请稍后重试；本次不会扣除积分');
+      }
       
       setUserCredits(data.remaining_credits);
 
@@ -270,7 +303,7 @@ export default function OptimizePage() {
             </div>
             <div>
               <h2 className="text-2xl font-extrabold mb-2">整体优化评分</h2>
-              <p className="text-slate-700 text-sm leading-relaxed mb-3">{printingReport.report_data?.summary}</p>
+              <p className="text-slate-700 text-sm leading-relaxed mb-3 whitespace-pre-wrap">{printingReport.report_data?.summary}</p>
               <div className="flex flex-wrap gap-2">
                 {printingReport.report_data?.good_points?.map((p:string, i:number) => (
                   <span key={i} className="px-3 py-1 bg-emerald-50 text-emerald-800 rounded-full text-xs font-bold border border-emerald-200">✓ {p}</span>
@@ -639,7 +672,7 @@ export default function OptimizePage() {
                       <div className="text-xs font-bold text-indigo-500 mb-2 tracking-widest uppercase">诊断摘要 · {pageType}</div>
                       <h2 className={`text-3xl font-extrabold mb-4 pr-32 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>整体优化评分：{report.scores.overall}/100</h2>
                       
-                      <div className={`border p-5 rounded-xl mb-4 text-sm leading-relaxed ${isDarkMode ? 'border-rose-900/50 bg-rose-900/10 text-rose-200' : 'border-rose-100 bg-rose-50 text-rose-800'}`}>
+                      <div className={`border p-5 rounded-xl mb-4 text-sm leading-relaxed whitespace-pre-wrap ${isDarkMode ? 'border-rose-900/50 bg-rose-900/10 text-rose-200' : 'border-rose-100 bg-rose-50 text-rose-800'}`}>
                         {report.summary}
                       </div>
                       
@@ -890,7 +923,7 @@ export default function OptimizePage() {
                               <div className="flex-1">
                                 <div className="text-xs font-bold text-indigo-500 mb-2 tracking-widest uppercase">诊断摘要 · {item.page_type || '首页'}</div>
                                 <h3 className={`text-2xl font-extrabold mb-3 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>整体优化评分：{data.scores.overall}/100</h3>
-                                <div className={`border p-4 rounded-xl text-sm leading-relaxed ${isDarkMode ? 'border-rose-900/50 bg-rose-900/10 text-rose-200' : 'border-rose-100 bg-rose-50 text-rose-800'}`}>
+                                <div className={`border p-4 rounded-xl text-sm leading-relaxed whitespace-pre-wrap ${isDarkMode ? 'border-rose-900/50 bg-rose-900/10 text-rose-200' : 'border-rose-100 bg-rose-50 text-rose-800'}`}>
                                   {data.summary}
                                 </div>
                               </div>

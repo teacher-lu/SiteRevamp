@@ -2,11 +2,16 @@ import os
 import uuid
 import json
 import re
+import logging
+import asyncio
 import httpx
 import html2text
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends, HTTPException, status
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
@@ -18,12 +23,30 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from dotenv import load_dotenv
 
-# 1. 在文件最顶部加载 .env 文件
-load_dotenv()
+# 从 backend/.env 加载后端专用配置；不要依赖启动命令所在的目录。
+load_dotenv(Path(__file__).with_name(".env"))
+
+
+def require_env(name: str, legacy_name: Optional[str] = None) -> str:
+    """Return a required setting, preferring the SiteRevamp-specific name."""
+    value = os.getenv(name)
+    if not value and legacy_name:
+        # Keeps existing Vercel deployments working during the environment-variable
+        # migration. The SITE_REVAMP_* name always wins when both are present.
+        value = os.getenv(legacy_name)
+    if not value:
+        accepted_names = f"{name} 或 {legacy_name}" if legacy_name else name
+        raise RuntimeError(
+            f"缺少必填环境变量 {accepted_names}。请复制 backend/.env.example 为 backend/.env 并填写。"
+        )
+    return value
+
+
+logger = logging.getLogger(__name__)
 
 # ----------------- 0. 鉴权与加密核心配置（使用环境变量） -----------------
-# 如果 .env 里没有配置 SECRET_KEY，则提供一个默认的降级方案
-SECRET_KEY = os.getenv("SECRET_KEY", "fallback_secret_key_here")
+# 这些名称都带 SITE_REVAMP 前缀，便于与同一机器上的其他项目区分。
+SECRET_KEY = require_env("SITE_REVAMP_JWT_SECRET_KEY", "SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
@@ -43,24 +66,20 @@ def create_access_token(data: dict):
 
 # 初始化 AI 客户端（直接从环境变量读取 API Key 和 Base URL）
 client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openlux.ai/v1") 
+    api_key=require_env("SITE_REVAMP_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    base_url=os.getenv(
+        "SITE_REVAMP_OPENAI_BASE_URL",
+        os.getenv("OPENAI_BASE_URL", "https://api.openlux.ai/v1"),
+    ),
 )
-
-app = FastAPI()
-
-# 允许前端跨域
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # 部署到 Vercel 后，前端和后端在同域，但为了兼容本地开发，可保持开放或配置具体域名
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+AI_MODEL = os.getenv("SITE_REVAMP_AI_MODEL", os.getenv("AI_MODEL", "gemini-4-argon"))
 
 # ----------------- 1. PostgreSQL 数据库连接配置 -----------------
-# 这里会自动读取你在 Vercel 或 .env 中配置的 Supabase 连接字符串
-SQLALCHEMY_DATABASE_URL = os.getenv("SQLALCHEMY_DATABASE_URL")
+# 在 Supabase Dashboard 的 Connect > ORMs > SQLAlchemy 中复制连接串。
+# Serverless 环境建议使用 Transaction pooler 的 6543 端口，并保留 sslmode=require。
+SQLALCHEMY_DATABASE_URL = require_env(
+    "SITE_REVAMP_SQLALCHEMY_DATABASE_URL", "SQLALCHEMY_DATABASE_URL"
+)
 
 # 【重要修改】: 针对 Serverless 环境添加了 pool_pre_ping=True
 # 这会在每次查询前自动检测连接是否有效，防止 Supabase 断开空闲连接导致报错
@@ -84,6 +103,33 @@ class ReportModel(Base):
     page_type = Column(String(100))
     report_data = Column(JSON, nullable=False)
     created_at = Column(TIMESTAMP)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 新 Supabase 项目首次启动时创建应用所需的两张表；已有表不会被删除或覆盖。
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+# 带凭据的 CORS 不能搭配通配符来源；同域部署无需额外来源。
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "SITE_REVAMP_CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_db():
     db = SessionLocal()
@@ -158,6 +204,91 @@ class ScrapeRequest(BaseModel):
     keyword: str
     page_type: str
 
+
+def parse_ai_report(raw_content: Optional[str]) -> dict:
+    """Normalize either a structured JSON report or a plain-text AI report."""
+    if not raw_content or not raw_content.strip():
+        raise ValueError("AI returned an empty response")
+
+    content = raw_content.strip()
+    normalized_content = content.lower()
+    gateway_errors = (
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    )
+    if any(marker in normalized_content for marker in gateway_errors):
+        raise ValueError("AI provider returned a gateway error")
+
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+
+    # Prefer the structured format whenever it is available.
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end >= start:
+        try:
+            report_data = json.loads(content[start : end + 1])
+            scores = report_data.get("scores") if isinstance(report_data, dict) else None
+            if isinstance(scores, dict) and all(
+                isinstance(scores.get(key), (int, float))
+                for key in ("overall", "google", "ai")
+            ) and isinstance(report_data.get("summary"), str):
+                return report_data
+        except json.JSONDecodeError:
+            pass
+
+    # Some compatible-model gateways return a useful text report rather than the
+    # requested JSON. Preserve it instead of treating useful analysis as a failure.
+    return {
+        "report_format": "text",
+        "scores": {"overall": 0, "google": 0, "ai": 0},
+        "summary": content,
+        "good_points": [],
+        "priority_actions": [],
+        "title_suggestions": [],
+        "meta_suggestions": [],
+        "h1_suggestions": [],
+        "h2_suggestions": [],
+        "faq_suggestions": [],
+        "internal_links": [],
+        "backlink_opportunities": [],
+    }
+
+
+async def generate_ai_report(system_prompt: str) -> dict:
+    """Request an AI report, retrying transient gateway and malformed-output failures."""
+    last_error: Optional[Exception] = None
+
+    for attempt in range(3):
+        try:
+            completion = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "请生成结构化的深度优化诊断报告。只需返回 JSON。"},
+                ],
+                temperature=0.7,
+            )
+            return parse_ai_report(completion.choices[0].message.content)
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "AI attempt %s/3 failed for model %s: %s",
+                attempt + 1,
+                AI_MODEL,
+                exc,
+            )
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+
+    raise RuntimeError("AI did not produce a valid report after retries") from last_error
+
 @app.post("/api/analyze")
 async def analyze_page(
     request: ScrapeRequest, 
@@ -166,6 +297,11 @@ async def analyze_page(
 ):
     if current_user.credits <= 0:
         raise HTTPException(status_code=403, detail="您的积分已用完，请充值后继续")
+
+    # End the authentication read transaction before network and AI calls. The
+    # credit is rechecked under a row lock immediately before it is charged.
+    current_user_id = current_user.id
+    db.rollback()
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -204,7 +340,8 @@ async def analyze_page(
     当前 H1: {h1_tags}
     页面正文: {markdown_content}
 
-    请必须以纯 JSON 格式返回结果，严格遵循以下结构（不要任何 markdown 标记）：
+    优先以纯 JSON 格式返回结果，严格遵循以下结构（不要任何 markdown 标记）。
+    如果当前模型或渠道不支持 JSON 模式，请直接输出完整、可读的中文文本诊断报告；不要输出 API 错误、状态码或解释说明：
     {{
         "scores": {{"overall": 72, "google": 75, "ai": 68}},
         "summary": "这是一个典型的垂直电商独立站首页，产品分类非常清晰，但目前严重缺乏基础 SEO 优化...",
@@ -239,29 +376,31 @@ async def analyze_page(
     """
 
     try:
-        completion = await client.chat.completions.create(
-            model="gemini-3.1-pro-preview", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "请生成结构化的深度优化诊断报告。只需返回 JSON。"}
-            ],
-            temperature=0.7
+        report_data = await generate_ai_report(system_prompt)
+    except Exception as exc:
+        logger.exception("AI analysis request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="AI 服务暂时不可用，请稍后重试；本次不会扣除积分。",
+        ) from exc
+
+    try:
+        # Lock and recheck immediately before charging. Report insertion and the
+        # credit decrement are committed together, so either both persist or neither does.
+        locked_user = (
+            db.query(UserModel)
+            .filter(UserModel.id == current_user_id)
+            .with_for_update()
+            .first()
         )
-        
-        raw_content = completion.choices[0].message.content
-        clean_content = raw_content.strip()
-        if clean_content.startswith("```json"): clean_content = clean_content[7:]
-        elif clean_content.startswith("```"): clean_content = clean_content[3:]
-        if clean_content.endswith("```"): clean_content = clean_content[:-3]
-            
-        report_data = json.loads(clean_content.strip())
-        
-        current_user.credits -= 1
-        db.commit()
+        if locked_user is None:
+            raise HTTPException(status_code=401, detail="用户不存在或登录已失效")
+        if locked_user.credits <= 0:
+            raise HTTPException(status_code=403, detail="您的积分已用完，请充值后继续")
 
         new_report = ReportModel(
             id=str(uuid.uuid4()),
-            user_id=current_user.id,
+            user_id=locked_user.id,
             target_url=request.url,
             keyword=request.keyword,
             page_type=request.page_type,
@@ -269,17 +408,25 @@ async def analyze_page(
             created_at=datetime.now()
         )
         db.add(new_report)
+        locked_user.credits -= 1
+        remaining_credits = locked_user.credits
         db.commit()
 
         return {
             "status": "success", 
-            "remaining_credits": current_user.credits,
+            "remaining_credits": remaining_credits,
             "report": report_data
         }
-        
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"AI 分析失败: {str(e)}")
+        logger.exception("Saving completed AI report failed")
+        raise HTTPException(
+            status_code=500,
+            detail="报告保存失败，请稍后重试；本次不会扣除积分。",
+        ) from e
 
 # ----------------- 5. 获取当前用户的历史报告列表 API -----------------
 @app.get("/api/reports")
