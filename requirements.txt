@@ -1,2 +1,12 @@
-# Vercel installs Python dependencies from the repository root.
--r backend/requirements.txt
+# Python dependencies for Vercel's api/index.py Function.
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+openai
+passlib[bcrypt]
+python-jose[cryptography]
+python-dotenv
+httpx
+beautifulsoup4
+html2text
