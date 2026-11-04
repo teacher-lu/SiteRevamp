@@ -1,2 +1,14 @@
-# Vercel installs Python dependencies from the repository root.
--r backend/requirements.txt
+# Python dependencies for Vercel's api/index.py Function.
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+openai
+# passlib 1.7.4 reads bcrypt.__about__, which was removed in bcrypt 4.1+.
+passlib==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]
+python-dotenv
+httpx
+beautifulsoup4
+html2text
